@@ -3,6 +3,8 @@ import io
 import json
 import os
 import sys
+import zipfile
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 import argparse
@@ -23,6 +25,7 @@ INPUT_DIR = DATA_DIR / "input"
 OUTPUT_DIR = DATA_DIR / "output"
 DB_DIR = DATA_DIR / "db"
 BATCH_DIR = DB_DIR / "batches"
+ARCHIVE_DIR = DATA_DIR / "archive"
 BATCH_INDEX = DB_DIR / "batch_index.json"
 
 
@@ -106,7 +109,7 @@ RESET = "\033[0m"
 
 
 def ensure_dirs():
-    for d in (INPUT_DIR, OUTPUT_DIR, DB_DIR, BATCH_DIR):
+    for d in (INPUT_DIR, OUTPUT_DIR, DB_DIR, BATCH_DIR, ARCHIVE_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -248,6 +251,18 @@ def load_batch(batch_id):
     return v, s, p
 
 
+def has_checked(batch_id):
+    bp = batch_path(batch_id)
+    return bp.exists() and (bp / "check_results.pkl").exists()
+
+
+def load_check_results(batch_id):
+    bp = batch_path(batch_id)
+    if not bp.exists() or not (bp / "check_results.pkl").exists():
+        return None
+    return pd.read_pickle(bp / "check_results.pkl")
+
+
 def cal_status(last, cyc, today):
     if not isinstance(last, datetime):
         return "未知", "-", ""
@@ -377,19 +392,22 @@ def cmd_import(args):
         print()
         field_report_lines.append("")
 
-    if fatal_errors:
-        cprint("=" * 72, RED, bold=True)
-        cprint("  X 字段识别存在致命错误，导入中止，请修改表头后重试：", RED, bold=True)
-        for e in fatal_errors:
-            cprint(f"    · {e}", RED)
-        cprint("=" * 72, RED)
-        return 1
-
     report_path = OUTPUT_DIR / f"field_report_{batch_id}.txt"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(field_report_lines))
     cprint(f"  [报告] 字段识别报告已保存: {report_path}", CYAN)
     print()
+
+    if fatal_errors:
+        cprint("=" * 72, RED, bold=True)
+        cprint("  X 字段识别存在致命错误，导入中止，请修改表头后重试：", RED, bold=True)
+        for e in fatal_errors:
+            cprint(f"    · {e}", RED)
+        cprint()
+        cprint(f"  [报告] 字段识别报告已保存，可查看：", YELLOW)
+        cprint(f"  {report_path}", YELLOW)
+        cprint("=" * 72, RED)
+        return 1
 
     cprint("=" * 72, BOLD)
     cprint("  [统计] 行级数据质量检查", BOLD)
@@ -732,6 +750,28 @@ def cmd_check(args):
     df_merged["cal_label"] = cal_labels
     df_merged["_cal_color"] = cal_colors
 
+    def sort_priority(row):
+        p_cal = 0
+        if row["cal_tag"] == "[逾期]":
+            p_cal = 0
+        elif row["cal_tag"] == "[临期]":
+            p_cal = 1
+        else:
+            p_cal = 2
+        p_status = 0
+        if row["status"] == STATUS_FAIL:
+            p_status = 0
+        elif row["status"] == STATUS_WARN:
+            p_status = 1
+        else:
+            p_status = 2
+        p_consec = 0 if row["consecutive_high"] else 1
+        p_dev = -row["abs_deviation"]
+        return (p_cal, p_status, p_consec, p_dev)
+
+    df_merged["_sort_key"] = df_merged.apply(sort_priority, axis=1)
+    df_merged = df_merged.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+
     check_path = batch_path(batch_id) / "check_results.pkl"
     df_merged.to_pickle(check_path)
     df_merged.to_pickle(DB_DIR / "check_results.pkl")
@@ -746,85 +786,74 @@ def cmd_check(args):
     }
     consec_high = df_merged[df_merged["consecutive_high"] == True].copy()
 
-    def print_group(title, color, df, show_all=False):
-        width = 88
-        cprint("─" * width, color, bold=True)
-        cprint(f"  {title}（共 {len(df)} 条）", color, bold=True)
-        cprint("─" * width, color)
-        if df.empty:
-            cprint("  (无记录)", color)
-            print()
-            return
-        hdr = (f"  {'车牌':<10}{'车厢':<8}{'位置':<10}{'校准时间':<20}"
-               f"{'偏差(°C)':>10}  {'校准状态':<12}")
-        cprint(hdr, color, bold=True)
-        print_limit = len(df) if show_all else min(len(df), 20)
-        for _, r in df.head(print_limit).iterrows():
-            dev = f"{r['deviation']:+.3f}"
-            flag = " ↗↗" if r.get("consecutive_high") else ""
-            dev_color = color
-            if r["status"] == STATUS_FAIL:
-                dev_color = RED
-            elif r["status"] == STATUS_WARN:
-                dev_color = YELLOW
-            cal_c = r["_cal_color"] or color
-            parts = (
-                f"  {r['plate']:<10}{r['carriage']:<8}{r['position']:<10}"
-                f"{r['calibration_time'].strftime('%Y-%m-%d %H:%M'):<20}"
-            )
-            cprint(parts, dev_color, bold=False)
-            cprint(f"{dev:>10}{flag}", dev_color)
-            cprint(f"  {r['cal_label']:<12}", cal_c)
-            print()
-        if not show_all and len(df) > print_limit:
-            cprint(f"  ... 其余 {len(df) - print_limit} 条略，详见 {export_csv.name}", color)
-        print()
+    cprint("=" * 110, BOLD)
+    cprint(f"  核对结果表格（按 逾期优先 → 严重超差优先 → 临近超差 → 合格）", BOLD)
+    cprint("=" * 110, BOLD)
+    print()
 
-    print_group(STATUS_PASS, GREEN, status_groups[STATUS_PASS], show_all=args.verbose)
-    print_group(STATUS_WARN, YELLOW, status_groups[STATUS_WARN], show_all=True)
-    print_group(STATUS_FAIL, RED, status_groups[STATUS_FAIL], show_all=True)
+    hdr = (f"  {'#':>3} {'车牌':<10}{'车厢':<8}{'位置':<10}{'校准时间':<18}"
+           f"{'标准':>7}{'探头':>7}{'偏差(°C)':>10}{'等级':<8}{'校准':<10}{'标记':<6}")
+    cprint(hdr, BOLD)
+    cprint("  " + "-" * 104, DIM)
 
-    if not consec_high.empty:
-        cprint("=" * 88, YELLOW, bold=True)
-        cprint("  [!] 同一车厢/位置连续两次偏高（建议重点检查，可能存在漂移趋势）", YELLOW, bold=True)
-        cprint("=" * 88, YELLOW)
-        hdr = f"  {'车牌':<10}{'车厢':<8}{'位置':<10}{'最近校准时间':<20}{'本次偏差':>12}  {'上次→本次趋势':<22}"
-        cprint(hdr, YELLOW, bold=True)
-        for _, r in consec_high.iterrows():
-            dev = f"{r['deviation']:+.3f}°C"
-            prev_dev_str = ""
-            grp_key = (r["plate"], r["carriage"], r["position"])
-            grp = df_pairs[
-                (df_pairs["plate"] == grp_key[0]) &
-                (df_pairs["carriage"] == grp_key[1]) &
-                (df_pairs["position"] == grp_key[2])
-            ].sort_values("calibration_time")
-            if len(grp) >= 2:
-                prev = grp.iloc[-2]
-                cur = grp.iloc[-1]
-                delta = cur["deviation"] - prev["deviation"]
-                trend = f"{prev['deviation']:+.2f} → {cur['deviation']:+.2f} (Δ{delta:+.2f})"
-                prev_dev_str = trend
-            line = (f"  {r['plate']:<10}{r['carriage']:<8}{r['position']:<10}"
-                    f"{r['calibration_time'].strftime('%Y-%m-%d %H:%M'):<20}{dev:>12}  {prev_dev_str:<22}")
-            cprint(line, YELLOW)
-        print()
+    print_limit = len(df_merged) if args.verbose else min(len(df_merged), 50)
+    shown = 0
+    for idx, r in df_merged.head(print_limit).iterrows():
+        shown += 1
+        dev = f"{r['deviation']:+.3f}"
+        status = r["status"]
+        status_c = GREEN if status == STATUS_PASS else (YELLOW if status == STATUS_WARN else RED)
+        cal_c = r["_cal_color"] or ""
+        flag = "↗↗" if r.get("consecutive_high") else ""
+        flag_c = MAGENTA if flag else ""
 
-    cprint("=" * 88, BOLD)
-    total = len(df_pairs)
-    p_pass = len(status_groups[STATUS_PASS])
-    p_warn = len(status_groups[STATUS_WARN])
-    p_fail = len(status_groups[STATUS_FAIL])
-    rate = p_pass / total * 100 if total else 0
-    cprint(f"  核对汇总: 共 {total} 条 | {GREEN}合格 {p_pass}{RESET} | {YELLOW}临近 {p_warn}{RESET} | {RED}超差 {p_fail}{RESET} | 合格率 {rate:.1f}%", BOLD)
+        std_t = f"{r['standard_temp']:.1f}"
+        probe_t = f"{r['probe_temp']:.1f}"
 
-    overdue_cnt = (df_merged["cal_tag"].str.contains("逾期")).sum()
-    soon_cnt = (df_merged["cal_tag"].str.contains("临期")).sum()
-    if overdue_cnt or soon_cnt:
-        cprint(f"  校准周期: {RED}逾期 {overdue_cnt} 个{RESET} | {YELLOW}7天内到期 {soon_cnt} 个{RESET}", BOLD)
+        line = (
+            f"  {shown:>3} "
+            f"{r['plate']:<10}"
+            f"{r['carriage']:<8}"
+            f"{r['position']:<10}"
+            f"{r['calibration_time'].strftime('%Y-%m-%d %H:%M'):<18}"
+            f"{std_t:>7}"
+            f"{probe_t:>7}"
+            f"{dev:>10}  "
+            f"{status:<8}"
+        )
+        line_with_cal = line + f"{r['cal_label']:<10}"
+        line_full = line_with_cal + f" {flag:<6}"
+        
+        status_part = line[:len(line)]
+        cal_part = f"{r['cal_label']:<10}"
+        flag_part = f" {flag:<6}"
+        full_line = status_part + cal_part + flag_part
+        print(full_line)
+
+    if not args.verbose and len(df_merged) > print_limit:
+        cprint(f"  ... 其余 {len(df_merged) - print_limit} 条略，加 -v 显示全部或查看 {export_csv.name}", DIM)
+    print()
+
+    cprint("=" * 110, BOLD)
+    cprint(f"  分类汇总  |  共 {len(df_merged)} 条  |  {GREEN}合格 {len(status_groups[STATUS_PASS])}  |  {YELLOW}临近超差 {len(status_groups[STATUS_WARN])}  |  {RED}严重超差 {len(status_groups[STATUS_FAIL])}  |", BOLD)
+    rate = len(status_groups[STATUS_PASS]) / len(df_merged) * 100 if len(df_merged) else 0
+    cprint(f"             |  合格率 {rate:.1f}%", BOLD)
+
+    overdue_cnt = (df_merged["cal_tag"] == "[逾期]").sum()
+    soon_cnt = (df_merged["cal_tag"] == "[临期]").sum()
+    consec_cnt = len(consec_high)
+    if overdue_cnt or soon_cnt or consec_cnt:
+        parts = []
+        if overdue_cnt:
+            parts.append(f"{RED}逾期 {overdue_cnt} 个{RESET}")
+        if soon_cnt:
+            parts.append(f"{YELLOW}临期 {soon_cnt} 个{RESET}")
+        if consec_cnt:
+            parts.append(f"{MAGENTA}连续偏高 {consec_cnt} 个{RESET}")
+        cprint(f"             |  {'  |  '.join(parts)}", BOLD)
 
     cprint(f"  CSV导出: {export_csv}", CYAN)
-    cprint("=" * 88, BOLD)
+    cprint("=" * 110, BOLD)
     return 0
 
 
@@ -895,12 +924,11 @@ def cmd_summary(args):
         cprint(f"[错误] 批次 {batch_id} 数据损坏", RED, bold=True)
         return 1
 
-    check_path = batch_path(batch_id) / "check_results.pkl"
-    if not check_path.exists():
-        check_path = DB_DIR / "check_results.pkl"
-    if not check_path.exists():
-        cprint("[错误] 未找到核对结果，请先执行 check 命令", RED, bold=True)
+    if not has_checked(batch_id):
+        cprint(f"[错误] 批次 {batch_id} 尚未执行核对，请先运行：", RED, bold=True)
+        cprint(f"  python coldchain_calib.py check -c 冷冻 -d 30 -b {batch_id}", RED)
         return 1
+    check_path = batch_path(batch_id) / "check_results.pkl"
     df_check = pd.read_pickle(check_path)
 
     tolerance = args.tolerance if args.tolerance else 1.0
@@ -909,13 +937,37 @@ def cmd_summary(args):
     today = datetime.now()
 
     idx = load_batch_index()
-    prev_batch_id = None
-    if len(idx) >= 2:
+    prev_batch_id = getattr(args, "compare_with", None)
+    prev_meta = None
+
+    if prev_batch_id:
+        prev_batch_id, prev_meta = resolve_batch(prev_batch_id)
+        if prev_batch_id is None:
+            cprint(f"[错误] 指定的对比批次不存在", RED, bold=True)
+            return 1
+        if not has_checked(prev_batch_id):
+            cprint(f"[错误] 对比批次 {prev_batch_id} 尚未执行核对，请先运行：", RED, bold=True)
+            cprint(f"  python coldchain_calib.py check -c 冷冻 -d 30 -b {prev_batch_id}", RED)
+            return 1
+    else:
         for i, e in enumerate(idx):
             if e["batch_id"] == batch_id:
-                if i + 1 < len(idx):
-                    prev_batch_id = idx[i + 1]["batch_id"]
+                for j in range(i + 1, len(idx)):
+                    candidate = idx[j]["batch_id"]
+                    if has_checked(candidate):
+                        prev_batch_id = candidate
+                        prev_meta = idx[j]
+                        break
                 break
+
+    unchecked_batches = []
+    for e in idx:
+        if not has_checked(e["batch_id"]):
+            unchecked_batches.append(e["batch_id"])
+    if unchecked_batches:
+        cprint(f"  [提示] 以下批次已导入但未核对：{', '.join(unchecked_batches)}", YELLOW)
+        cprint(f"  请先执行核对命令，避免混用其他批次结果", YELLOW)
+        print()
 
     cprint("=" * 80, BOLD)
     cprint("          冷链探头校准月度摘要报告（车队经理版）", BOLD)
@@ -1260,6 +1312,136 @@ def cmd_summary(args):
     return 0
 
 
+def cmd_clean(args):
+    ensure_dirs()
+    keep = args.keep
+    dry_run = args.dry_run
+    archive = args.archive
+    delete = args.delete
+    skip_confirm = args.yes
+
+    if keep < 1:
+        cprint("[错误] 保留批次数量至少为1", RED, bold=True)
+        return 1
+
+    if not archive and not delete:
+        archive = True
+        cprint("[提示] 未指定操作模式，默认归档（--archive）。加 --delete 可直接删除。", YELLOW)
+        print()
+
+    idx = load_batch_index()
+    if len(idx) <= keep:
+        cprint(f"[信息] 当前共 {len(idx)} 个批次，保留 {keep} 个，无需清理。", GREEN)
+        return 0
+
+    keep_entries = idx[:keep]
+    clean_entries = idx[keep:]
+
+    cprint("=" * 72, BOLD)
+    cprint("  批次清理工具", BOLD)
+    cprint("=" * 72, BOLD)
+    cprint(f"  当前批次总数: {len(idx)}    保留最近: {keep}个    需清理: {len(clean_entries)}个", "")
+    mode = "归档为zip" if archive else "直接删除"
+    cprint(f"  操作模式: {mode}", "")
+    if dry_run:
+        cprint(f"  运行模式: 仅预览（--dry-run）", YELLOW)
+    print()
+
+    cprint(f"  【保留的批次（最近{keep}个）】", GREEN, bold=True)
+    for i, e in enumerate(keep_entries):
+        c = e["counts"]
+        cprint(f"  {i+1:>2}. {e['batch_id']:<24} {e['created_at'][:19]}  {c['vehicles']}/{c['standards']}/{c['probes']} 条", GREEN)
+    print()
+
+    cprint(f"  【将清理的批次（{len(clean_entries)}个）】", RED, bold=True)
+    for i, e in enumerate(clean_entries):
+        c = e["counts"]
+        cprint(f"  {i+1:>2}. {e['batch_id']:<24} {e['created_at'][:19]}  {c['vehicles']}/{c['standards']}/{c['probes']} 条", RED)
+    print()
+
+    if not skip_confirm and not dry_run:
+        confirm = input(f"  确认{mode}以上 {len(clean_entries)} 个批次？(yes/NO): ").strip().lower()
+        if confirm != "yes":
+            cprint("  已取消操作。", YELLOW)
+            return 0
+        print()
+
+    archive_path = None
+    if archive:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_name = f"archive_{ts}_batch_{len(clean_entries)}.zip"
+        archive_path = ARCHIVE_DIR / archive_name
+
+    errors = []
+    archived_count = 0
+    deleted_count = 0
+
+    for e in clean_entries:
+        bid = e["batch_id"]
+        bp = batch_path(bid)
+
+        try:
+            if not bp.exists():
+                cprint(f"  [!] 批次 {bid} 目录不存在，跳过", YELLOW)
+                continue
+
+            if archive and not dry_run:
+                if not zipfile.is_zipfile(archive_path):
+                    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for root, _, files in os.walk(bp):
+                            for f in files:
+                                fpath = Path(root) / f
+                                arcname = f"{bid}/{fpath.relative_to(bp)}"
+                                zf.write(fpath, arcname)
+                else:
+                    with zipfile.ZipFile(archive_path, "a", zipfile.ZIP_DEFLATED) as zf:
+                        for root, _, files in os.walk(bp):
+                            for f in files:
+                                fpath = Path(root) / f
+                                arcname = f"{bid}/{fpath.relative_to(bp)}"
+                                zf.write(fpath, arcname)
+
+                archived_count += 1
+                cprint(f"  V 已归档: {bid}", GREEN)
+                shutil.rmtree(bp)
+                cprint(f"  V 已删除源目录: {bid}", DIM)
+            elif delete and not dry_run:
+                shutil.rmtree(bp)
+                deleted_count += 1
+                cprint(f"  V 已删除: {bid}", GREEN)
+            else:
+                cprint(f"  [预览] 将处理: {bid}", DIM)
+
+        except Exception as ex:
+            errors.append(f"{bid}: {str(ex)}")
+            cprint(f"  X 处理失败: {bid} - {ex}", RED)
+
+    if not dry_run:
+        new_idx = keep_entries
+        save_batch_index(new_idx)
+
+        cprint()
+        cprint("=" * 72, BOLD)
+        if archive:
+            cprint(f"  V 清理完成！已归档 {archived_count} 个批次", GREEN, bold=True)
+            cprint(f"  压缩包: {archive_path}", GREEN)
+        else:
+            cprint(f"  V 清理完成！已删除 {deleted_count} 个批次", GREEN, bold=True)
+
+        if errors:
+            cprint(f"  X 失败 {len(errors)} 个:", RED)
+            for e in errors:
+                cprint(f"    · {e}", RED)
+        cprint(f"  剩余批次: {len(new_idx)} 个", "")
+        cprint("=" * 72, BOLD)
+    else:
+        cprint("=" * 72, YELLOW)
+        cprint(f"  [预览] 以上是将要执行的操作，去掉 --dry-run 即可实际执行", YELLOW, bold=True)
+        cprint("=" * 72, YELLOW)
+
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="coldchain-calib",
@@ -1307,6 +1489,20 @@ def main():
                            help="校准周期(天)，默认30天或车辆清单设定")
     p_summary.add_argument("-b", "--batch", default=None,
                            help="指定批次号，默认使用最新批次")
+    p_summary.add_argument("--compare-with", default=None,
+                           help="指定对比批次号(不指定则自动找上一批已核对的)")
+
+    p_clean = sub.add_parser("clean", help="批次清理：保留最近N个，旧批次归档或删除")
+    p_clean.add_argument("--keep", type=int, default=10,
+                         help="保留最近N个批次，默认10")
+    p_clean.add_argument("--archive", action="store_true",
+                         help="将清理的批次打包为zip压缩包，保存到archive目录")
+    p_clean.add_argument("--delete", action="store_true",
+                         help="不归档，直接删除旧批次（请谨慎使用）")
+    p_clean.add_argument("--dry-run", action="store_true",
+                         help="仅预览操作，不实际删除或归档")
+    p_clean.add_argument("-y", "--yes", action="store_true",
+                         help="跳过确认提示，直接执行")
 
     args = parser.parse_args()
 
@@ -1324,6 +1520,8 @@ def main():
         return cmd_check(args)
     elif args.command == "summary":
         return cmd_summary(args)
+    elif args.command == "clean":
+        return cmd_clean(args)
     else:
         parser.print_help()
         return 1
