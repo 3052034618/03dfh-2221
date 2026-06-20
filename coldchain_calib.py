@@ -113,7 +113,32 @@ def ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
-def cprint(msg, color="", bold=False):
+def _save_field_report(report_path, lines, extra_errors=None, batch_id=None):
+    ensure_dirs()
+    full = []
+    if batch_id:
+        full.append("=" * 70)
+        full.append(f"冷链校准 - 字段识别报告    批次: {batch_id}")
+        full.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        full.append("=" * 70)
+        full.append("")
+    if lines:
+        full.extend(lines)
+    if extra_errors:
+        full.append("")
+        full.append("【错误信息】")
+        for e in extra_errors:
+            full.append(f"  · {e}")
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(full))
+        cprint()
+        cprint(f"  [报告] 字段识别报告已保存: {report_path}", CYAN)
+    except Exception as ex:
+        cprint(f"  [警告] 保存报告失败: {ex}", YELLOW)
+
+
+def cprint(msg="", color="", bold=False):
     prefix = f"{BOLD if bold else ''}{color}"
     print(f"{prefix}{msg}{RESET}")
 
@@ -998,8 +1023,8 @@ def cmd_summary(args):
         问题数=("status", "count"),
         严重超差=("status", lambda s: (s == STATUS_FAIL).sum()),
         临近超差=("status", lambda s: (s == STATUS_WARN).sum()),
-        最严重偏差=("abs_deviation", "max"),
         逾期探头=("cal_tag", lambda s: sum(1 for x in s if "逾期" in str(x))),
+        最严重偏差=("abs_deviation", "max"),
     ).sort_values(["严重超差", "问题数"], ascending=False)
 
     df_problem_veh_export = problem_vehicles.reset_index().copy()
@@ -1314,132 +1339,172 @@ def cmd_summary(args):
 
 def cmd_clean(args):
     ensure_dirs()
-    keep = args.keep
-    dry_run = args.dry_run
-    archive = args.archive
-    delete = args.delete
-    skip_confirm = args.yes
 
-    if keep < 1:
-        cprint("[错误] 保留批次数量至少为1", RED, bold=True)
-        return 1
+    try:
+        keep = args.keep
+        dry_run = args.dry_run
+        archive = args.archive
+        delete = args.delete
+        skip_confirm = args.yes
 
-    if not archive and not delete:
-        archive = True
-        cprint("[提示] 未指定操作模式，默认归档（--archive）。加 --delete 可直接删除。", YELLOW)
-        print()
+        if keep < 1:
+            cprint("[错误] 保留批次数量至少为1", RED, bold=True)
+            return 1
 
-    idx = load_batch_index()
-    if len(idx) <= keep:
-        cprint(f"[信息] 当前共 {len(idx)} 个批次，保留 {keep} 个，无需清理。", GREEN)
-        return 0
+        if not archive and not delete:
+            archive = True
+            cprint("[提示] 未指定操作模式，默认归档（--archive）。加 --delete 可直接删除。", YELLOW)
+            print()
 
-    keep_entries = idx[:keep]
-    clean_entries = idx[keep:]
-
-    cprint("=" * 72, BOLD)
-    cprint("  批次清理工具", BOLD)
-    cprint("=" * 72, BOLD)
-    cprint(f"  当前批次总数: {len(idx)}    保留最近: {keep}个    需清理: {len(clean_entries)}个", "")
-    mode = "归档为zip" if archive else "直接删除"
-    cprint(f"  操作模式: {mode}", "")
-    if dry_run:
-        cprint(f"  运行模式: 仅预览（--dry-run）", YELLOW)
-    print()
-
-    cprint(f"  【保留的批次（最近{keep}个）】", GREEN, bold=True)
-    for i, e in enumerate(keep_entries):
-        c = e["counts"]
-        cprint(f"  {i+1:>2}. {e['batch_id']:<24} {e['created_at'][:19]}  {c['vehicles']}/{c['standards']}/{c['probes']} 条", GREEN)
-    print()
-
-    cprint(f"  【将清理的批次（{len(clean_entries)}个）】", RED, bold=True)
-    for i, e in enumerate(clean_entries):
-        c = e["counts"]
-        cprint(f"  {i+1:>2}. {e['batch_id']:<24} {e['created_at'][:19]}  {c['vehicles']}/{c['standards']}/{c['probes']} 条", RED)
-    print()
-
-    if not skip_confirm and not dry_run:
-        confirm = input(f"  确认{mode}以上 {len(clean_entries)} 个批次？(yes/NO): ").strip().lower()
-        if confirm != "yes":
-            cprint("  已取消操作。", YELLOW)
+        idx = load_batch_index()
+        if len(idx) <= keep:
+            cprint(f"[信息] 当前共 {len(idx)} 个批次，保留 {keep} 个，无需清理。", GREEN)
             return 0
+
+        keep_entries = idx[:keep]
+        clean_entries = idx[keep:]
+
+        cprint("=" * 72, BOLD)
+        cprint("  批次清理工具", BOLD)
+        cprint("=" * 72, BOLD)
+        cprint(f"  当前批次总数: {len(idx)}    保留最近: {keep}个    需清理: {len(clean_entries)}个", "")
+        mode = "归档为zip" if archive else "直接删除"
+        cprint(f"  操作模式: {mode}", "")
+        if dry_run:
+            cprint(f"  运行模式: 仅预览（--dry-run）", YELLOW)
         print()
 
-    archive_path = None
-    if archive:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_name = f"archive_{ts}_batch_{len(clean_entries)}.zip"
-        archive_path = ARCHIVE_DIR / archive_name
+        cprint(f"  【保留的批次（最近{keep}个）】", GREEN, bold=True)
+        for i, e in enumerate(keep_entries):
+            c = e["counts"]
+            cprint(f"  {i+1:>2}. {e['batch_id']:<24} {e['created_at'][:19]}  {c['vehicles']}/{c['standards']}/{c['probes']} 条", GREEN)
+        print()
 
-    errors = []
-    archived_count = 0
-    deleted_count = 0
+        cprint(f"  【将清理的批次（{len(clean_entries)}个）】", RED, bold=True)
+        for i, e in enumerate(clean_entries):
+            c = e["counts"]
+            cprint(f"  {i+1:>2}. {e['batch_id']:<24} {e['created_at'][:19]}  {c['vehicles']}/{c['standards']}/{c['probes']} 条", RED)
+        print()
 
-    for e in clean_entries:
-        bid = e["batch_id"]
-        bp = batch_path(bid)
+        if not skip_confirm and not dry_run:
+            try:
+                confirm = input(f"  确认{mode}以上 {len(clean_entries)} 个批次？(yes/NO): ").strip().lower()
+            except EOFError:
+                confirm = "no"
+            if confirm != "yes":
+                cprint("  已取消操作。", YELLOW)
+                return 0
+            print()
+
+        archive_path = None
+        if archive and not dry_run:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_name = f"archive_{ts}_batch_{len(clean_entries)}.zip"
+            archive_path = ARCHIVE_DIR / archive_name
+
+        errors = []
+        successful_ids = set()
+        archived_count = 0
+        deleted_count = 0
 
         try:
-            if not bp.exists():
-                cprint(f"  [!] 批次 {bid} 目录不存在，跳过", YELLOW)
-                continue
+            for e in clean_entries:
+                bid = e["batch_id"]
+                bp = batch_path(bid)
 
-            if archive and not dry_run:
-                if not zipfile.is_zipfile(archive_path):
-                    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                        for root, _, files in os.walk(bp):
-                            for f in files:
-                                fpath = Path(root) / f
-                                arcname = f"{bid}/{fpath.relative_to(bp)}"
-                                zf.write(fpath, arcname)
-                else:
-                    with zipfile.ZipFile(archive_path, "a", zipfile.ZIP_DEFLATED) as zf:
-                        for root, _, files in os.walk(bp):
-                            for f in files:
-                                fpath = Path(root) / f
-                                arcname = f"{bid}/{fpath.relative_to(bp)}"
-                                zf.write(fpath, arcname)
+                try:
+                    if not bp.exists():
+                        cprint(f"  [!] 批次 {bid} 目录不存在，视为处理成功", YELLOW)
+                        successful_ids.add(bid)
+                        continue
 
-                archived_count += 1
-                cprint(f"  V 已归档: {bid}", GREEN)
-                shutil.rmtree(bp)
-                cprint(f"  V 已删除源目录: {bid}", DIM)
-            elif delete and not dry_run:
-                shutil.rmtree(bp)
-                deleted_count += 1
-                cprint(f"  V 已删除: {bid}", GREEN)
+                    if archive and not dry_run:
+                        if not zipfile.is_zipfile(archive_path):
+                            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                                for root, _, files in os.walk(bp):
+                                    for f in files:
+                                        fpath = Path(root) / f
+                                        arcname = f"{bid}/{fpath.relative_to(bp)}"
+                                        zf.write(fpath, arcname)
+                        else:
+                            with zipfile.ZipFile(archive_path, "a", zipfile.ZIP_DEFLATED) as zf:
+                                for root, _, files in os.walk(bp):
+                                    for f in files:
+                                        fpath = Path(root) / f
+                                        arcname = f"{bid}/{fpath.relative_to(bp)}"
+                                        zf.write(fpath, arcname)
+
+                        archived_count += 1
+                        cprint(f"  V 已归档: {bid}", GREEN)
+                        try:
+                            shutil.rmtree(bp)
+                            cprint(f"  V 已删除源目录: {bid}", DIM)
+                        except Exception:
+                            cprint(f"  [!] 源目录删除失败，但归档已完成", YELLOW)
+                        successful_ids.add(bid)
+                    elif delete and not dry_run:
+                        shutil.rmtree(bp)
+                        deleted_count += 1
+                        cprint(f"  V 已删除: {bid}", GREEN)
+                        successful_ids.add(bid)
+                    else:
+                        cprint(f"  [预览] 将处理: {bid}", DIM)
+
+                except Exception as ex:
+                    errors.append(f"{bid}: {str(ex)}")
+                    cprint(f"  X 处理失败: {bid} - {ex}", RED)
+
+        except Exception as loop_ex:
+            cprint(f"  X 清理循环异常中止: {loop_ex}", RED, bold=True)
+            errors.append(f"[循环异常] {loop_ex}")
+
+        if not dry_run:
+            remaining = []
+            for e in idx:
+                if e["batch_id"] in successful_ids:
+                    continue
+                remaining.append(e)
+            save_batch_index(remaining)
+
+            cprint()
+            cprint("=" * 72, BOLD)
+            if archive:
+                cprint(f"  V 清理完成！", GREEN, bold=True)
+                cprint(f"  • 成功归档: {archived_count} 个批次", GREEN)
+                if archive_path and archive_path.exists():
+                    cprint(f"  • 压缩包路径: {archive_path}", GREEN)
+                    size_kb = archive_path.stat().st_size / 1024
+                    if size_kb > 1024:
+                        cprint(f"  • 压缩包大小: {size_kb/1024:.2f} MB", GREEN)
+                    else:
+                        cprint(f"  • 压缩包大小: {size_kb:.2f} KB", GREEN)
             else:
-                cprint(f"  [预览] 将处理: {bid}", DIM)
+                cprint(f"  V 清理完成！", GREEN, bold=True)
+                cprint(f"  • 成功删除: {deleted_count} 个批次", GREEN)
 
-        except Exception as ex:
-            errors.append(f"{bid}: {str(ex)}")
-            cprint(f"  X 处理失败: {bid} - {ex}", RED)
-
-    if not dry_run:
-        new_idx = keep_entries
-        save_batch_index(new_idx)
-
-        cprint()
-        cprint("=" * 72, BOLD)
-        if archive:
-            cprint(f"  V 清理完成！已归档 {archived_count} 个批次", GREEN, bold=True)
-            cprint(f"  压缩包: {archive_path}", GREEN)
+            if errors:
+                cprint(f"  • 失败: {len(errors)} 个（仍保留在批次列表中）", RED)
+                for e in errors:
+                    cprint(f"    · {e}", RED)
+            cprint(f"  • 剩余批次: {len(remaining)} 个", "")
+            cprint("=" * 72, BOLD)
         else:
-            cprint(f"  V 清理完成！已删除 {deleted_count} 个批次", GREEN, bold=True)
+            cprint("=" * 72, YELLOW)
+            cprint(f"  [预览] 以上是将要执行的操作，去掉 --dry-run 即可实际执行", YELLOW, bold=True)
+            cprint("=" * 72, YELLOW)
 
-        if errors:
-            cprint(f"  X 失败 {len(errors)} 个:", RED)
-            for e in errors:
-                cprint(f"    · {e}", RED)
-        cprint(f"  剩余批次: {len(new_idx)} 个", "")
-        cprint("=" * 72, BOLD)
-    else:
-        cprint("=" * 72, YELLOW)
-        cprint(f"  [预览] 以上是将要执行的操作，去掉 --dry-run 即可实际执行", YELLOW, bold=True)
-        cprint("=" * 72, YELLOW)
+        return 0 if not errors else 2
 
-    return 0
+    except Exception as top_ex:
+        cprint()
+        cprint("=" * 72, RED, bold=True)
+        cprint("  X 清理工具出现致命错误，已中止：", RED, bold=True)
+        cprint(f"  {type(top_ex).__name__}: {top_ex}", RED)
+        cprint()
+        cprint("  注意：若部分批次已成功归档，则不会被回滚", RED)
+        cprint("  请使用 batches 命令查看当前批次索引", RED)
+        cprint("=" * 72, RED)
+        return 1
 
 
 def main():
@@ -1512,18 +1577,27 @@ def main():
 
     ensure_dirs()
 
-    if args.command == "import":
-        return cmd_import(args)
-    elif args.command == "batches":
-        return cmd_list_batches(args)
-    elif args.command == "check":
-        return cmd_check(args)
-    elif args.command == "summary":
-        return cmd_summary(args)
-    elif args.command == "clean":
-        return cmd_clean(args)
-    else:
-        parser.print_help()
+    try:
+        if args.command == "import":
+            return cmd_import(args)
+        elif args.command == "batches":
+            return cmd_list_batches(args)
+        elif args.command == "check":
+            return cmd_check(args)
+        elif args.command == "summary":
+            return cmd_summary(args)
+        elif args.command == "clean":
+            return cmd_clean(args)
+        else:
+            parser.print_help()
+            return 1
+    except Exception as ex:
+        cprint("=" * 72, RED, bold=True)
+        cprint("  [错误] 运行过程中出现异常：", RED, bold=True)
+        cprint(f"  {type(ex).__name__}: {ex}", RED)
+        cprint()
+        cprint("  请按上方提示检查，或把问题和相关数据反馈给技术支持", RED)
+        cprint("=" * 72, RED)
         return 1
 
 

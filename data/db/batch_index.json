@@ -1,40 +1,21 @@
 [
   {
-    "batch_id": "BAT-20260621-072055",
+    "batch_id": "BAT-20260621-074805",
     "source_files": {
       "vehicles": "车辆清单.csv",
       "standards": "标准温度计读数.csv",
       "probes": "车载探头读数.csv"
     },
     "counts": {
-      "vehicles": 16,
+      "vehicles": 18,
       "standards": 23,
       "probes": 23
     },
     "row_issues": {
-      "vehicles": 2,
+      "vehicles": 0,
       "standards": 2,
       "probes": 2
     },
-    "created_at": "2026-06-21T07:20:55.792584"
-  },
-  {
-    "batch_id": "BAT-20260621-072019",
-    "source_files": {
-      "vehicles": "车辆清单.csv",
-      "standards": "标准温度计读数.csv",
-      "probes": "车载探头读数.csv"
-    },
-    "counts": {
-      "vehicles": 16,
-      "standards": 23,
-      "probes": 23
-    },
-    "row_issues": {
-      "vehicles": 2,
-      "standards": 2,
-      "probes": 2
-    },
-    "created_at": "2026-06-21T07:20:19.497270"
+    "created_at": "2026-06-21T07:48:05.167419"
   }
 ]
